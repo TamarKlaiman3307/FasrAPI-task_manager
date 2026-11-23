@@ -3,7 +3,37 @@ from pydantic import BaseModel
 from typing import Optional
 import psycopg2
 import psycopg2.errors
-from security import hash_password
+from security import hash_password, verify_password, create_access_token, decode_access_token
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordRequestForm
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+##קיחת הטוקן מהבקשה ואם אין שגיאה 401
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+##פונקצית לשליחת הטוקן לבדיקה והחזרת המשתמש
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    payload = decode_access_token(token)
+
+    if payload is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token"
+        )
+
+    user_id = payload.get("sub")
+
+    if user_id is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Token does not contain user ID"
+        )
+
+    return user_id
 
 app = FastAPI()
 
@@ -12,7 +42,7 @@ DB_CONFIG = {
     "host": "localhost",
     "database": "task_manager",
     "user": "postgres",
-    "password": "ilovework",
+    "password":os.getenv("DB_PASSWORD"),
     "port": 5432,
 }
 
@@ -21,12 +51,15 @@ def get_connection():
 
 
 # ---------- מודלים (מבנה הנתונים שנכנסים) ----------
-
+#הרשמה
 class UserCreate(BaseModel):
     name: str
     email: str
     password: str
-
+##תחברות
+class UserLogin(BaseModel):
+    email: str
+    password: str
 
 class UserResponse(BaseModel):
     id: int
@@ -73,9 +106,41 @@ def register(user: UserCreate):
         cur.close()
         conn.close()
     return {"id": user_id, "name": user.name, "email": user.email}
+##התחברות בדיקה והוספת טוקן
+@app.post("/login")
+def login(user: OAuth2PasswordRequestForm = Depends()):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT id, password_hash FROM users WHERE email = %s",
+        (user.username,)
+
+    )
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if row is None:
+        raise HTTPException(status_code=401, detail="Email or password incorrect")
+
+    user_id = row[0]
+    hashed_password = row[1]
+
+    if not verify_password(user.password, hashed_password):
+        raise HTTPException(status_code=401, detail="Email or password incorrect")
+
+    access_token = create_access_token({"sub": str(user_id)})
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
 
 @app.get("/users")
-def get_users():
+def get_users(user_id: str = Depends(get_current_user)):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT id, name, email FROM users")
@@ -231,3 +296,8 @@ def delete_task(task_id: int):
     if deleted == 0:
         raise HTTPException(status_code=404, detail="לא נמצא")
     return {"message": "נמחק"}
+
+## בדיקת טוקן
+@app.get("/protected")
+def protected_route(user_id: str = Depends(get_current_user)):
+    return {"message": f"Hello user {user_id}"}
