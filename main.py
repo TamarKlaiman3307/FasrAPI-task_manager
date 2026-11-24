@@ -1,74 +1,85 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import Optional
-import psycopg2
-import psycopg2.errors
-from security import hash_password, verify_password, create_access_token, decode_access_token
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import OAuth2PasswordBearer
-from fastapi.security import OAuth2PasswordRequestForm
-from dotenv import load_dotenv
-import os
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
-load_dotenv()
+from db import get_db
+from models import User, Project, Task
+from security import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    decode_access_token
+)
+
+app = FastAPI()
 
 ##קיחת הטוקן מהבקשה ואם אין שגיאה 401
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
+
+# ---------- Authentication ----------
 ##פונקצית לשליחת הטוקן לבדיקה והחזרת המשתמש
-def get_current_user(token: str = Depends(oauth2_scheme)):
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
     payload = decode_access_token(token)
 
     if payload is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired token"
-        )
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     user_id = payload.get("sub")
 
     if user_id is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Token does not contain user ID"
-        )
+        raise HTTPException(status_code=401, detail="Token does not contain user ID")
 
-    return user_id
+    try:
+        user_id = int(user_id)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid user ID")
 
-app = FastAPI()
+    current_user = db.query(User).filter(User.id == user_id).first()
 
-# ---------- פרטי חיבור למסד ----------
-DB_CONFIG = {
-    "host": "localhost",
-    "database": "task_manager",
-    "user": "postgres",
-    "password":os.getenv("DB_PASSWORD"),
-    "port": 5432,
-}
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="User not found")
 
-def get_connection():
-    return psycopg2.connect(**DB_CONFIG)
+    return current_user
 
 
-# ---------- מודלים (מבנה הנתונים שנכנסים) ----------
-#הרשמה
+##בודק הרשאות
+def require_roles(*roles: str):
+    def role_checker(current_user: User = Depends(get_current_user)):
+        if current_user.role not in roles:
+            raise HTTPException(
+                status_code=403,
+                detail="אין לך הרשאה לבצע פעולה זו"
+            )
+        return current_user
+
+    return role_checker
+
+
+# ---------- Schemas ----------
+
 class UserCreate(BaseModel):
     name: str
     email: str
     password: str
-##תחברות
-class UserLogin(BaseModel):
-    email: str
-    password: str
+
 
 class UserResponse(BaseModel):
     id: int
     name: str
     email: str
 
+
 class ProjectCreate(BaseModel):
     name: str
     description: Optional[str] = None
+
 
 class TaskCreate(BaseModel):
     title: str
@@ -78,6 +89,7 @@ class TaskCreate(BaseModel):
     user_id: Optional[int] = None
     project_id: Optional[int] = None
 
+
 class TaskUpdate(BaseModel):
     status: Optional[str] = None
     priority: Optional[str] = None
@@ -85,219 +97,316 @@ class TaskUpdate(BaseModel):
     project_id: Optional[int] = None
 
 
-# ================= משתמשים =================
+# ================= Users =================
 
 @app.post("/register", response_model=UserResponse, status_code=201)
-def register(user: UserCreate):
+def register(user: UserCreate, db: Session = Depends(get_db)):
     hashed = hash_password(user.password)
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO users (name, email, password_hash) VALUES (%s, %s, %s) RETURNING id",
-            (user.name, user.email, hashed),
-        )
-        user_id = cur.fetchone()[0]
-        conn.commit()
-    except psycopg2.errors.UniqueViolation:
-        conn.rollback()
-        raise HTTPException(status_code=409, detail="האימייל כבר רשום")
-    finally:
-        cur.close()
-        conn.close()
-    return {"id": user_id, "name": user.name, "email": user.email}
-##התחברות בדיקה והוספת טוקן
-@app.post("/login")
-def login(user: OAuth2PasswordRequestForm = Depends()):
-    conn = get_connection()
-    cur = conn.cursor()
 
-    cur.execute(
-        "SELECT id, password_hash FROM users WHERE email = %s",
-        (user.username,)
-
+    new_user = User(
+        name=user.name,
+        email=user.email,
+        password_hash=hashed,
+        role="user"
     )
 
-    row = cur.fetchone()
+    db.add(new_user)
 
-    cur.close()
-    conn.close()
+    try:
+        db.commit()
+        db.refresh(new_user)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="האימייל כבר רשום")
 
-    if row is None:
+    return new_user
+
+
+@app.post("/login")
+def login(
+    user: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    db_user = db.query(User).filter(User.email == user.username).first()
+
+    if db_user is None:
         raise HTTPException(status_code=401, detail="Email or password incorrect")
 
-    user_id = row[0]
-    hashed_password = row[1]
-
-    if not verify_password(user.password, hashed_password):
+    if not verify_password(user.password, db_user.password_hash):
         raise HTTPException(status_code=401, detail="Email or password incorrect")
 
-    access_token = create_access_token({"sub": str(user_id)})
+    access_token = create_access_token({"sub": str(db_user.id)})
 
     return {
         "access_token": access_token,
         "token_type": "bearer"
     }
 
+
 @app.get("/users")
-def get_users(user_id: str = Depends(get_current_user)):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, email FROM users")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return [{"id": r[0], "name": r[1], "email": r[2]} for r in rows]
+def get_users(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role in ["admin", "secretary"]:
+        users = db.query(User).all()
+    else:
+        users = [current_user]
+
+    return [
+        {"id": user.id, "name": user.name, "email": user.email}
+        for user in users
+    ]
 
 
 @app.get("/users/{user_id}")
-def get_user(user_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, email FROM users WHERE id = %s", (user_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    if row is None:
+def get_user(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role == "user" and current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="אין לך הרשאה לצפות במשתמש זה")
+
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if user is None:
         raise HTTPException(status_code=404, detail="לא נמצא")
-    return {"id": row[0], "name": row[1], "email": row[2]}
+
+    return {"id": user.id, "name": user.name, "email": user.email}
 
 
 @app.delete("/users/{user_id}")
-def delete_user(user_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
-    conn.commit()
-    deleted = cur.rowcount
-    cur.close()
-    conn.close()
-    if deleted == 0:
+def delete_user(
+    user_id: int,
+    current_user: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if user is None:
         raise HTTPException(status_code=404, detail="לא נמצא")
+
+    db.delete(user)
+    db.commit()
+
     return {"message": "נמחק"}
 
 
-# ================= פרויקטים =================
+# ================= Projects =================
 
 @app.post("/projects", status_code=201)
-def create_project(project: ProjectCreate):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO projects (name, description) VALUES (%s, %s) RETURNING id",
-        (project.name, project.description),
+def create_project(
+    project: ProjectCreate,
+    current_user: User = Depends(require_roles("admin", "user")),
+    db: Session = Depends(get_db)
+):
+    new_project = Project(
+        name=project.name,
+        description=project.description,
+        owner_id=current_user.id
     )
-    project_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"id": project_id, "message": "פרויקט נוצר"}
+
+    db.add(new_project)
+    db.commit()
+    db.refresh(new_project)
+
+    return {"id": new_project.id, "message": "פרויקט נוצר"}
 
 
 @app.get("/projects")
-def get_projects():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, description FROM projects")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return [{"id": r[0], "name": r[1], "description": r[2]} for r in rows]
+def get_projects(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Project)
+
+    if current_user.role == "user":
+        query = query.filter(Project.owner_id == current_user.id)
+
+    projects = query.all()
+
+    return [
+        {
+            "id": project.id,
+            "name": project.name,
+            "description": project.description
+        }
+        for project in projects
+    ]
 
 
 @app.get("/projects/{project_id}")
-def get_project(project_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, description FROM projects WHERE id = %s", (project_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    if row is None:
+def get_project(
+    project_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+
+    if project is None:
         raise HTTPException(status_code=404, detail="לא נמצא")
-    return {"id": row[0], "name": row[1], "description": row[2]}
+
+    if current_user.role == "user" and project.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="אין לך הרשאה לצפות בפרויקט זה")
+
+    return {
+        "id": project.id,
+        "name": project.name,
+        "description": project.description
+    }
 
 
-# ================= משימות =================
+# ================= Tasks =================
 
 @app.post("/tasks", status_code=201)
-def create_task(task: TaskCreate):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """INSERT INTO tasks (title, description, status, priority, user_id, project_id)
-           VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
-        (task.title, task.description, task.status, task.priority,
-         task.user_id, task.project_id),
+def create_task(
+    task: TaskCreate,
+    current_user: User = Depends(require_roles("admin", "user")),
+    db: Session = Depends(get_db)
+):
+    if current_user.role == "user":
+        if task.user_id is not None and task.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="אין לך הרשאה לשייך משימה למשתמש אחר")
+
+        if task.project_id is not None:
+            project = db.query(Project).filter(
+                Project.id == task.project_id,
+                Project.owner_id == current_user.id
+            ).first()
+
+            if project is None:
+                raise HTTPException(status_code=403, detail="אין לך הרשאה להשתמש בפרויקט זה")
+
+        task_user_id = current_user.id
+    else:
+        task_user_id = task.user_id
+
+    new_task = Task(
+        title=task.title,
+        description=task.description,
+        status=task.status,
+        priority=task.priority,
+        user_id=task_user_id,
+        project_id=task.project_id
     )
-    task_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"id": task_id, "message": "משימה נוצרה"}
+
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
+
+    return {"id": new_task.id, "message": "משימה נוצרה"}
 
 
 @app.get("/tasks")
-def get_tasks():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, title, status, priority, user_id, project_id FROM tasks")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+def get_tasks(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Task)
+
+    if current_user.role == "user":
+        query = query.filter(Task.user_id == current_user.id)
+
+    tasks = query.all()
+
     return [
-        {"id": r[0], "title": r[1], "status": r[2],
-         "priority": r[3], "user_id": r[4], "project_id": r[5]}
-        for r in rows
+        {
+            "id": task.id,
+            "title": task.title,
+            "status": task.status,
+            "priority": task.priority,
+            "user_id": task.user_id,
+            "project_id": task.project_id
+        }
+        for task in tasks
     ]
 
 
 @app.get("/tasks/{task_id}")
-def get_task(task_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT id, title, status, priority, user_id, project_id FROM tasks WHERE id = %s", (task_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    if row is None:
+def get_task(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    task = db.query(Task).filter(Task.id == task_id).first()
+
+    if task is None:
         raise HTTPException(status_code=404, detail="לא נמצא")
-    return {"id": row[0], "title": row[1], "status": row[2],
-            "priority": row[3], "user_id": row[4], "project_id": row[5]}
+
+    if current_user.role == "user" and task.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="אין לך הרשאה לצפות במשימה זו")
+
+    return {
+        "id": task.id,
+        "title": task.title,
+        "status": task.status,
+        "priority": task.priority,
+        "user_id": task.user_id,
+        "project_id": task.project_id
+    }
 
 
 @app.put("/tasks/{task_id}")
-def update_task(task_id: int, task: TaskUpdate):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """UPDATE tasks SET status = %s, priority = %s, user_id = %s, project_id = %s
-           WHERE id = %s""",
-        (task.status, task.priority, task.user_id, task.project_id, task_id),
-    )
-    conn.commit()
-    updated = cur.rowcount
-    cur.close()
-    conn.close()
-    if updated == 0:
+def update_task(
+    task_id: int,
+    task: TaskUpdate,
+    current_user: User = Depends(require_roles("admin", "user")),
+    db: Session = Depends(get_db)
+):
+    db_task = db.query(Task).filter(Task.id == task_id).first()
+
+    if db_task is None:
         raise HTTPException(status_code=404, detail="לא נמצא")
+
+    if current_user.role == "user":
+        if db_task.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="אין לך הרשאה לעדכן משימה זו")
+
+        if task.user_id is not None and task.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="אין לך הרשאה להעביר משימה למשתמש אחר")
+
+        if task.project_id is not None:
+            project = db.query(Project).filter(
+                Project.id == task.project_id,
+                Project.owner_id == current_user.id
+            ).first()
+
+            if project is None:
+                raise HTTPException(status_code=403, detail="אין לך הרשאה להשתמש בפרויקט זה")
+
+    update_data = task.model_dump(exclude_unset=True)
+
+    for key, value in update_data.items():
+        setattr(db_task, key, value)
+
+    db.commit()
+
     return {"message": "עודכן"}
 
 
 @app.delete("/tasks/{task_id}")
-def delete_task(task_id: int):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
-    conn.commit()
-    deleted = cur.rowcount
-    cur.close()
-    conn.close()
-    if deleted == 0:
+def delete_task(
+    task_id: int,
+    current_user: User = Depends(require_roles("admin", "user")),
+    db: Session = Depends(get_db)
+):
+    task = db.query(Task).filter(Task.id == task_id).first()
+
+    if task is None:
         raise HTTPException(status_code=404, detail="לא נמצא")
+
+    if current_user.role == "user" and task.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="אין לך הרשאה למחוק משימה זו")
+
+    db.delete(task)
+    db.commit()
+
     return {"message": "נמחק"}
 
-## בדיקת טוקן
+
+# ================= Protected =================
+
 @app.get("/protected")
-def protected_route(user_id: str = Depends(get_current_user)):
-    return {"message": f"Hello user {user_id}"}
+def protected_route(current_user: User = Depends(get_current_user)):
+    return {"message": f"Hello user {current_user.id}"}

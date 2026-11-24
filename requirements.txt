@@ -4,4 +4,6 @@ psycopg2-binary==2.9.13
 python-dotenv==1.2.4
 bcrypt==5.0.0
 PyJWT==2.15.1
-python-multipart==0.0.34rt
+python-multipart==0.0.34
+alembic==1.20.1
+SQLAlchemy==2.1.9

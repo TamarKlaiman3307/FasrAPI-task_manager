@@ -1,12 +1,33 @@
-import psycopg2
 
-DB_CONFIG = {
-    "host": "localhost",
-    "database": "task_manager",
-    "user": "postgres",
-    "password": "a1b2c3d4",   # ← החלפי בסיסמה האמיתית
-    "port": 5432,
-}
+import os
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-def get_connection():
-    return psycopg2.connect(**DB_CONFIG)
+load_dotenv()
+
+DATABASE_URL = (
+    f"postgresql+psycopg2://{os.getenv('DB_USER', 'postgres')}:"
+    f"{os.getenv('DB_PASSWORD')}@"
+    f"{os.getenv('DB_HOST', 'localhost')}:"
+    f"{os.getenv('DB_PORT', '5432')}/"
+    f"{os.getenv('DB_NAME', 'task_manager')}"
+)
+
+engine = create_engine(DATABASE_URL)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
+
+Base = declarative_base()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
