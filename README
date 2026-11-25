@@ -1,0 +1,54 @@
+מערכת לניהול משימות – Task Manager API
+התקנת הפרויקט
+1. שכפול הפרויקט (Clone)
+git clone https://github.com/TamarKlaiman3307/FasrAPI-task_manager.git
+cd FasrAPI-task_manager
+2. יצירת סביבה וירטואלית והפעלתה
+python -m venv .venv
+
+source .venv/Scripts/activate
+
+3. התקנת ספריות
+pip install -r requirements.txt
+4. הגדרת משתני סביבה
+יש ליצור קובץ .env בתיקיית הפרויקט ולהגדיר בו את פרטי החיבור למסד הנתונים ואת מפתח ה־JWT.
+DATABASE_URL=your_database_connection_string
+JWT_SECRET_KEY=your_secret_key
+.
+5. יצירת מסד הנתונים
+יש ליצור מסד נתונים ב־PostgreSQL בשם:
+task_manager
+6. הרצת מיגרציות
+alembic upgrade head
+פקודה זו יוצרת ומעדכנת את הטבלאות במסד הנתונים בהתאם למיגרציות הקיימות.
+ליצירת מיגרציה חדשה לאחר שינוי במודלים
+
+הפעלת הפרויקט
+להפעלת השרת יש להריץ:
+uvicorn main:app --reload
+כתובת השרת:
+http://127.0.0.1:8000
+תיעוד ובדיקת הקריאות באמצעות Swagger:
+http://127.0.0.1:8000/docs
+
+הרשמה  והתחברות:
+•	POST /register – הרשמת משתמש חדש. משתמש חדש מקבל הרשאת user.
+•	POST /login – התחברות למערכת וקבלת JWT.
+•	יש לשלוח את הטוקן בבקשות המוגנות דרך Swagger באמצעות Authorize.
+
+הרשאות ואבטחה
+כל הקריאות המוגנות דורשות JWT תקין.
+•	401 Unauthorized – לא נשלח טוקן, או שהטוקן אינו תקין או שפג תוקפו.
+•	403 Forbidden – המשתמש מזוהה, אך אין לו הרשאה לבצע את הפעולה המבוקשת.
+ההרשאות נבדקות בכל בקשה לפי תפקיד המשתמש ובהתאם להרשאות שלו
+
+טכנולוגיות
+•	Python
+•	FastAPI
+•	PostgreSQL
+•	SQLAlchemy
+•	Alembic – לניהול מיגרציות של מסד הנתונים
+•	JWT – לאימות משתמשים
+•	bcrypt – להצפנת סיסמאות
+
+
